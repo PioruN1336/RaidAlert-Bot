@@ -10,10 +10,10 @@ from aiohttp import web
 from datetime import datetime
 
 # ================== CONFIG ==================
-TOKEN        = os.getenv("BOT_TOKEN")
-API_SECRET   = os.getenv("API_SECRET", "super_tajne_haslo")
-PORT         = int(os.getenv("PORT", 8080))
-CODE_EXPIRY  = int(os.getenv("LINK_CODE_EXPIRY", 300))
+TOKEN       = os.getenv("BOT_TOKEN")
+API_SECRET  = os.getenv("API_SECRET", "super_tajne_haslo")
+PORT        = int(os.getenv("PORT", 8080))
+CODE_EXPIRY = int(os.getenv("LINK_CODE_EXPIRY", 300))
 
 if not TOKEN:
     print("ERROR: BOT_TOKEN nie ustawiony!")
@@ -21,12 +21,8 @@ if not TOKEN:
 
 LINKS_FILE = "links.json"
 
-# ================== CACHE (ważne dla wydajności!) ==================
-# Zamiast czytać plik przy każdym rajdzie
-# trzymamy wszystko w pamięci RAM
-
+# ================== CACHE ==================
 _links_cache: dict = {}
-_cache_dirty: bool = False
 
 def _load_links_from_disk():
     global _links_cache
@@ -34,23 +30,26 @@ def _load_links_from_disk():
         _links_cache = {}
         _save_links_to_disk()
         return
-    with open(LINKS_FILE, "r") as f:
-        _links_cache = json.load(f)
-    print(f"[Cache] Loaded {len(_links_cache)} links from disk.")
+    try:
+        with open(LINKS_FILE, "r") as f:
+            _links_cache = json.load(f)
+        print(f"[Cache] Loaded {len(_links_cache)} links from disk.")
+    except Exception as e:
+        print(f"[Cache] Failed to load links: {e}")
+        _links_cache = {}
 
 def _save_links_to_disk():
-    global _cache_dirty
-    with open(LINKS_FILE, "w") as f:
-        json.dump(_links_cache, f, indent=2)
-    _cache_dirty = False
+    try:
+        with open(LINKS_FILE, "w") as f:
+            json.dump(_links_cache, f, indent=2)
+    except Exception as e:
+        print(f"[Cache] Failed to save links: {e}")
 
 def get_discord_id(steam_id: str):
-    # Tylko RAM - bez I/O
     entry = _links_cache.get(str(steam_id))
     return int(entry["discord_id"]) if entry else None
 
 def link_accounts(steam_id: str, discord_id: int):
-    global _cache_dirty
     # Usuń stare linki dla tego discord ID
     to_remove = [
         k for k, v in _links_cache.items()
@@ -63,12 +62,9 @@ def link_accounts(steam_id: str, discord_id: int):
         "discord_id": str(discord_id),
         "linked_at": time.time()
     }
-    _cache_dirty = True
-    # Zapisz na dysk natychmiast po linkowaniu
     _save_links_to_disk()
 
 def unlink_account(discord_id: int) -> bool:
-    global _cache_dirty
     to_remove = [
         k for k, v in _links_cache.items()
         if v["discord_id"] == str(discord_id)
@@ -77,7 +73,6 @@ def unlink_account(discord_id: int) -> bool:
         return False
     for k in to_remove:
         del _links_cache[k]
-    _cache_dirty = True
     _save_links_to_disk()
     return True
 
@@ -86,14 +81,15 @@ PENDING_CODES: dict = {}
 
 def cleanup_codes():
     now = time.time()
-    expired = [c for c, v in PENDING_CODES.items()
-               if now - v["created"] > CODE_EXPIRY]
+    expired = [
+        c for c, v in PENDING_CODES.items()
+        if now - v["created"] > CODE_EXPIRY
+    ]
     for c in expired:
         del PENDING_CODES[c]
     return len(expired)
 
-# ================== RATE LIMITING ==================
-# Prosta ochrona przed spamem DM per user
+# ================== DM COOLDOWN ==================
 _dm_cooldowns: dict = {}
 DM_COOLDOWN_SECONDS = 30
 
@@ -119,8 +115,8 @@ async def on_ready():
     except Exception as e:
         print(f"Sync error: {e}")
 
-    # Uruchom auto-cleanup kodów co minutę
-    bot.loop.create_task(auto_cleanup_task())
+    # Auto cleanup kodów co minutę
+    asyncio.create_task(auto_cleanup_task())
 
 async def auto_cleanup_task():
     while True:
@@ -168,7 +164,7 @@ async def slash_link(interaction: discord.Interaction, code: str):
 # ─── /unlink ───
 @bot.tree.command(
     name="unlink",
-    description="Unlink your Discord from Steam. You will stop receiving raid alerts.")
+    description="Unlink your Discord from Steam.")
 async def slash_unlink(interaction: discord.Interaction):
     removed = unlink_account(interaction.user.id)
     if removed:
@@ -197,14 +193,14 @@ async def slash_linkstatus(interaction: discord.Interaction):
         await interaction.response.send_message(
             f"✅ **Linked!**\n"
             f"Steam ID: `{found}`\n"
-            f"Linked at: {date_str}",
+            f"Linked at: `{date_str}`",
             ephemeral=True)
     else:
         await interaction.response.send_message(
             "❌ Not linked. Use `/linkdiscord` in-game first.",
             ephemeral=True)
 
-# ================== API SERVER ==================
+# ================== API HANDLERY ==================
 
 async def handle_raid_alert(request: web.Request):
     if request.headers.get("Authorization") != f"Bearer {API_SECRET}":
@@ -217,14 +213,12 @@ async def handle_raid_alert(request: web.Request):
 
     owner_steam = str(data.get("owner_steam_id", ""))
 
-    # Rate limiting po stronie bota (dodatkowa warstwa)
     if not check_dm_cooldown(owner_steam):
         return web.json_response({
             "status": "cooldown",
             "reason": "DM cooldown active"
         })
 
-    # Pobierz Discord ID z cache (bez I/O!)
     discord_id = get_discord_id(owner_steam)
     if not discord_id:
         return web.json_response({
@@ -254,12 +248,14 @@ async def handle_raid_alert(request: web.Request):
 
     embed.add_field(
         name="⚔️ Raider",
-        value=f"{data.get('raider_name', 'Unknown')}\n`{data.get('raider_steam_id', '?')}`",
+        value=f"{data.get('raider_name', 'Unknown')}"
+              f"\n`{data.get('raider_steam_id', '?')}`",
         inline=True)
 
     embed.add_field(
         name="🧱 Object",
-        value=f"{data.get('object_name', 'Unknown')}\n({data.get('object_type', '?')})",
+        value=f"{data.get('object_name', 'Unknown')}"
+              f"\n({data.get('object_type', '?')})",
         inline=True)
 
     embed.add_field(
@@ -281,7 +277,7 @@ async def handle_raid_alert(request: web.Request):
 
     try:
         await user.send(embed=embed)
-        print(f"[DM] Sent raid alert to {user} (owner of {data.get('object_name')})")
+        print(f"[DM] Sent to {user} | Raider: {data.get('raider_name')}")
         return web.json_response({"status": "sent"})
     except discord.Forbidden:
         return web.json_response({
@@ -289,30 +285,34 @@ async def handle_raid_alert(request: web.Request):
             "reason": "User has DMs disabled"
         })
     except Exception as e:
-        return web.json_response({"status": "error", "reason": str(e)}, status=500)
+        return web.json_response({
+            "status": "error",
+            "reason": str(e)
+        }, status=500)
+
 
 async def handle_generate_code(request: web.Request):
     if request.headers.get("Authorization") != f"Bearer {API_SECRET}":
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     try:
-        data   = await request.json()
-        steam  = str(data["steam_id"])
-        code   = secrets.token_hex(4).upper()
+        data  = await request.json()
+        steam = str(data["steam_id"])
 
         # Usuń stary kod dla tego steama
         old = [c for c, v in PENDING_CODES.items() if v["steam_id"] == steam]
         for c in old:
             del PENDING_CODES[c]
 
+        code = secrets.token_hex(4).upper()
         PENDING_CODES[code] = {"steam_id": steam, "created": time.time()}
         print(f"[Code] Generated {code} for Steam {steam}")
         return web.json_response({"code": code})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=400)
 
+
 async def handle_stats(request: web.Request):
-    """Endpoint do sprawdzania statystyk bota."""
     if request.headers.get("Authorization") != f"Bearer {API_SECRET}":
         return web.json_response({"error": "Unauthorized"}, status=401)
 
@@ -323,23 +323,38 @@ async def handle_stats(request: web.Request):
         "bot_latency_ms":  round(bot.latency * 1000, 2)
     })
 
-# ================== START ==================
+# ================== START (NAPRAWIONY) ==================
 
-async def main():
+async def start_web_server():
+    """Uruchamia HTTP server osobno."""
     app = web.Application()
-    app.router.add_post("/raid-alert",     handle_raid_alert)
-    app.router.add_post("/generate-code",  handle_generate_code)
-    app.router.add_get("/stats",           handle_stats)
+    app.router.add_post("/raid-alert",    handle_raid_alert)
+    app.router.add_post("/generate-code", handle_generate_code)
+    app.router.add_get("/stats",          handle_stats)
 
     runner = web.AppRunner(app)
     await runner.setup()
+
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"[API] HTTP server running on port {PORT}")
 
-    async with bot:
-        await main()
-        await bot.start(TOKEN)
+    return runner
 
+async def main():
+    """Główna funkcja - nie wywołuje sama siebie."""
+    # 1. Uruchom HTTP server
+    runner = await start_web_server()
+
+    try:
+        # 2. Uruchom bota Discord
+        async with bot:
+            await bot.start(TOKEN)
+    finally:
+        # 3. Cleanup przy zamknięciu
+        await runner.cleanup()
+        print("[Bot] Shutdown complete.")
+
+# ================== ENTRY POINT ==================
 if __name__ == "__main__":
     asyncio.run(main())
