@@ -16,7 +16,7 @@ PORT        = int(os.getenv("PORT", 8080))
 CODE_EXPIRY = int(os.getenv("LINK_CODE_EXPIRY", 300))
 
 if not TOKEN:
-    print("ERROR: BOT_TOKEN nie ustawiony!")
+    print("ERROR: BOT_TOKEN not set!")
     exit(1)
 
 LINKS_FILE = "links.json"
@@ -50,7 +50,7 @@ def get_discord_id(steam_id: str):
     return int(entry["discord_id"]) if entry else None
 
 def link_accounts(steam_id: str, discord_id: int):
-    # Usuń stare linki dla tego discord ID
+    # Remove old links for this discord ID
     to_remove = [
         k for k, v in _links_cache.items()
         if v["discord_id"] == str(discord_id)
@@ -115,7 +115,6 @@ async def on_ready():
     except Exception as e:
         print(f"Sync error: {e}")
 
-    # Auto cleanup kodów co minutę
     asyncio.create_task(auto_cleanup_task())
 
 async def auto_cleanup_task():
@@ -200,9 +199,34 @@ async def slash_linkstatus(interaction: discord.Interaction):
             "❌ Not linked. Use `/linkdiscord` in-game first.",
             ephemeral=True)
 
-# ================== API HANDLERY ==================
+# ================== API HANDLERS ==================
+
+# ─── BRAKUJĄCY ENDPOINT - to był główny bug ───
+async def handle_is_linked(request: web.Request):
+    """
+    GET /is-linked?steam_id=XXXXXXXXXXXXXXXXX
+    Returns: {"linked": true/false}
+    Plugin calls this before sending DM to check if owner has Discord linked.
+    """
+    if request.headers.get("Authorization") != f"Bearer {API_SECRET}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    steam_id = request.rel_url.query.get("steam_id", "").strip()
+    if not steam_id:
+        return web.json_response({"error": "Missing steam_id"}, status=400)
+
+    discord_id = get_discord_id(steam_id)
+    linked = discord_id is not None
+
+    print(f"[IsLinked] steam={steam_id} linked={linked}")
+    return web.json_response({"linked": linked})
+
 
 async def handle_raid_alert(request: web.Request):
+    """
+    POST /raid-alert
+    Sends a Discord DM to the owner of a raided structure.
+    """
     if request.headers.get("Authorization") != f"Bearer {API_SECRET}":
         return web.json_response({"error": "Unauthorized"}, status=401)
 
@@ -212,7 +236,10 @@ async def handle_raid_alert(request: web.Request):
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
     owner_steam = str(data.get("owner_steam_id", ""))
+    if not owner_steam:
+        return web.json_response({"error": "Missing owner_steam_id"}, status=400)
 
+    # Check DM cooldown (bot-side extra protection)
     if not check_dm_cooldown(owner_steam):
         return web.json_response({
             "status": "cooldown",
@@ -221,10 +248,11 @@ async def handle_raid_alert(request: web.Request):
 
     discord_id = get_discord_id(owner_steam)
     if not discord_id:
+        # Return 404 so plugin can invalidate its link cache
         return web.json_response({
             "status": "no_link",
             "reason": "Steam not linked to Discord"
-        })
+        }, status=404)
 
     try:
         user = bot.get_user(discord_id)
@@ -264,7 +292,12 @@ async def handle_raid_alert(request: web.Request):
         inline=True)
 
     embed.add_field(
-        name="🔫 Origin",
+        name="🔫 Weapon",
+        value=data.get("weapon_name", "Unknown"),
+        inline=True)
+
+    embed.add_field(
+        name="💣 Origin",
         value=data.get("damage_origin", "Unknown"),
         inline=True)
 
@@ -277,7 +310,7 @@ async def handle_raid_alert(request: web.Request):
 
     try:
         await user.send(embed=embed)
-        print(f"[DM] Sent to {user} | Raider: {data.get('raider_name')}")
+        print(f"[DM] Sent to {user} (steam={owner_steam}) | Raider: {data.get('raider_name')}")
         return web.json_response({"status": "sent"})
     except discord.Forbidden:
         return web.json_response({
@@ -292,6 +325,10 @@ async def handle_raid_alert(request: web.Request):
 
 
 async def handle_generate_code(request: web.Request):
+    """
+    POST /generate-code
+    Generates a link code for the given steam_id.
+    """
     if request.headers.get("Authorization") != f"Bearer {API_SECRET}":
         return web.json_response({"error": "Unauthorized"}, status=401)
 
@@ -299,7 +336,7 @@ async def handle_generate_code(request: web.Request):
         data  = await request.json()
         steam = str(data["steam_id"])
 
-        # Usuń stary kod dla tego steama
+        # Remove old code for this steam
         old = [c for c, v in PENDING_CODES.items() if v["steam_id"] == steam]
         for c in old:
             del PENDING_CODES[c]
@@ -313,6 +350,10 @@ async def handle_generate_code(request: web.Request):
 
 
 async def handle_stats(request: web.Request):
+    """
+    GET /stats
+    Returns bot statistics.
+    """
     if request.headers.get("Authorization") != f"Bearer {API_SECRET}":
         return web.json_response({"error": "Unauthorized"}, status=401)
 
@@ -323,14 +364,14 @@ async def handle_stats(request: web.Request):
         "bot_latency_ms":  round(bot.latency * 1000, 2)
     })
 
-# ================== START (NAPRAWIONY) ==================
+# ================== START ==================
 
 async def start_web_server():
-    """Uruchamia HTTP server osobno."""
     app = web.Application()
+    app.router.add_get ("/is-linked",     handle_is_linked)      # <-- DODANY
     app.router.add_post("/raid-alert",    handle_raid_alert)
     app.router.add_post("/generate-code", handle_generate_code)
-    app.router.add_get("/stats",          handle_stats)
+    app.router.add_get ("/stats",         handle_stats)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -338,23 +379,16 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"[API] HTTP server running on port {PORT}")
-
     return runner
 
 async def main():
-    """Główna funkcja - nie wywołuje sama siebie."""
-    # 1. Uruchom HTTP server
     runner = await start_web_server()
-
     try:
-        # 2. Uruchom bota Discord
         async with bot:
             await bot.start(TOKEN)
     finally:
-        # 3. Cleanup przy zamknięciu
         await runner.cleanup()
         print("[Bot] Shutdown complete.")
 
-# ================== ENTRY POINT ==================
 if __name__ == "__main__":
     asyncio.run(main())
